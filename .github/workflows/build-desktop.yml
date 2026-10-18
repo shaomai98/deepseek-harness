@@ -1,0 +1,166 @@
+# 在 GitHub 托管的 Mac 和 Windows 上打桌面安装包。不改 master，也不发布更新。
+name: build-desktop
+# 手动运行，或把会影响安装包的改动推到 dev 时运行。
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    # 文档、许可证、编辑器配置和其他工作流不触发。本文件放在最后，避免被前面的忽略规则挡住。
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!docs/**'
+      - '!**/*.i18n.yaml'
+      - '!**/LICENSE'
+      - '!**/LICENSE.txt'
+      - '!**/.vscode/**'
+      - '!**/.idea/**'
+      - '!.editorconfig'
+      - '!.prettierrc*'
+      - '!.prettierignore'
+      - '!.oxlintrc*'
+      - '!.eslintrc*'
+      - '!eslint.config.*'
+      - '!.eslintignore'
+      - '!.github/ISSUE_TEMPLATE/**'
+      - '!.github/workflows/*'
+      - '.github/workflows/build-desktop.yml'
+permissions:
+  contents: read
+# 同一分支后面的推送不取消已经在跑的打包。
+concurrency:
+  group: build-desktop-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    # Mac 只做签名公证。Windows 做未签名包。一台失败不拖垮另一台。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-arm64
+            shell: bash
+            artifact: macos-arm64-signed
+            package: package:desktop:mac:arm64
+            globs: apps/desktop/.desktop-build/targets/mac-arm64/artifacts/*.dmg apps/desktop/.desktop-build/targets/mac-arm64/artifacts/*.zip
+          - os: windows-latest
+            name: windows-x64
+            shell: pwsh
+            artifact: windows-x64-unsigned
+            package: package:desktop:win:x64:unsigned
+            globs: apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v5.0.0
+        with:
+          version: 11.28.5
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
+      # 按锁文件缓存 pnpm store。相同锁文件会直接复用。
+      - name: 安装 Node 并缓存 pnpm
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          cache: pnpm
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+      # 五个密钥缺任何一个就列出名字并失败。齐全则从证书读出签名身份，写进 .env.macos。
+      - name: 写入 macOS 签名配置
+        id: settings
+        if: runner.os == 'macOS'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          miss=()
+          for n in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            eval "v=\${$n-}"
+            [[ -n "${v//[[:space:]]/}" ]] || miss+=("$n")
+          done
+          [[ ${#miss[@]} -eq 0 ]] || { printf 'missing secret: %s\n' "${miss[*]}" >&2; exit 1; }
+          p12="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$CSC_LINK" | tr -d '[:space:]' | sed 's|^data:application/x-pkcs12;base64,||' | base64 -D > "$p12"
+          read_subject() { /usr/bin/openssl pkcs12 -in "$p12" -clcerts -nokeys -passin env:CSC_KEY_PASSWORD "$@" | /usr/bin/openssl x509 -noout -subject -nameopt RFC2253; }
+          subject=$(read_subject 2>/dev/null || read_subject -legacy)
+          cn=${subject#*CN=}
+          if [[ "$cn" == */* ]]; then cn=${cn%%/*}; else cn=$(printf '%s' "$cn" | sed 's/\\,/\x1f/g;s/,.*//;s/\x1f/,/g'); fi
+          identity=$(printf '%s' "${cn#Developer ID Application: }" | sed 's/^ *//;s/ *$//')
+          team=$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+          umask 077
+          cat > apps/desktop/.env.macos <<EOF
+          DSH_DESKTOP_APP_ID=com.deepseek.harness
+          DSH_DESKTOP_AUTO_UPDATE_ENV=test
+          DOWNLOAD_TEST_ORIGIN=https://example.com
+          DOWNLOAD_TEST_RELEASE_ID=00000000000000000000000000000000
+          DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://example.com
+          DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='{"allowedAuthOrigins":["https://example.com"]}'
+          DSH_DESKTOP_MACOS_SIGNING_IDENTITY='$identity'
+          DSH_DESKTOP_MACOS_TEAM_ID=$team
+          CSC_LINK=$p12
+          CSC_KEY_PASSWORD='$CSC_KEY_PASSWORD'
+          APPLE_ID='$APPLE_ID'
+          APPLE_APP_SPECIFIC_PASSWORD='$APPLE_APP_SPECIFIC_PASSWORD'
+          APPLE_TEAM_ID=$team
+          EOF
+      # 未签名的 Windows 包也要读应用 ID 和更新策略。这里不写证书。
+      # GitHub 的 Windows runner 有 4 个 vCPU，tarball 打包用 4 个 worker。
+      - name: 写入 Windows 配置
+        id: settings-windows
+        if: runner.os == 'Windows'
+        run: |
+          $content = @'
+          DSH_DESKTOP_APP_ID=com.deepseek.harness
+          DSH_DESKTOP_AUTO_UPDATE_ENV=test
+          DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://example.com
+          DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='{"allowedAuthOrigins":["https://example.com"]}'
+          DSH_DESKTOP_WINDOWS_PACK_CONCURRENCY=4
+          '@
+          Set-Content -Path apps/desktop/.env.windows -Value $content -Encoding ascii
+      # Mac 打已签名并公证的包。Windows 打未签名安装包。都不发布更新。
+      - name: 打包
+        run: pnpm run ${{ matrix.package }}
+      - name: 收集安装包
+        if: success()
+        shell: bash
+        run: |
+          stage="$RUNNER_TEMP/fork-desktop-artifacts"
+          [[ "$RUNNER_OS" == "Windows" ]] && stage="$(cygpath -u "$RUNNER_TEMP")/fork-desktop-artifacts"
+          mkdir -p "$stage"
+          shopt -s nullglob
+          files=(${{ matrix.globs }})
+          [[ ${#files[@]} -gt 0 ]] || { echo 'fork desktop package: no installer was produced' >&2; exit 1; }
+          cp "${files[@]}" "$stage/"
+      - name: 上传安装包
+        if: success()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ matrix.artifact }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/fork-desktop-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+      # 配置写成功后，无论打包成败都留下日志。
+      - name: 上传打包日志
+        if: always() && (steps.settings.outcome == 'success' || steps.settings-windows.outcome == 'success')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fork-package-logs-${{ matrix.name }}-${{ github.run_id }}
+          include-hidden-files: true
+          path: apps/desktop/.desktop-build/packaging-runs/
+          if-no-files-found: ignore
+          retention-days: 14

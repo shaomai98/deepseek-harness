@@ -4,11 +4,11 @@ name: build-desktop
 on:
   workflow_dispatch:
     inputs:
-      # 仅手动运行可开；push 触发一律走未签名路径。
+      # 手动运行默认签名；取消勾选才打未签名包（验证用）。push 一律签名公证。
       sign:
-        description: 'macOS 是否签名并公证（默认否；push 触发忽略此输入、一律不签名）'
+        description: 'macOS 是否签名并公证（默认是；取消勾选打未签名包。push 触发忽略此输入、一律签名）'
         type: boolean
-        default: false
+        default: true
         required: true
   push:
     branches: [dev]
@@ -43,7 +43,7 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
-    # Mac：push / sign=false 走已有 --unsigned 路径；仅 workflow_dispatch 且 sign=true 时签名公证。
+    # Mac：push 一律签名公证；workflow_dispatch 仅 sign=false 走已有 --unsigned 路径。
     # Windows：始终未签名。一台失败不拖垮另一台。
     strategy:
       fail-fast: false
@@ -67,8 +67,8 @@ jobs:
         shell: ${{ matrix.shell }}
     env:
       DSH_TELEMETRY_DISABLED: '1'
-      # 默认：仅 workflow_dispatch 且 sign=true。签名路径缺 secret 仍直接失败，不回退。
-      DSH_CI_MAC_SIGN: ${{ github.event_name == 'workflow_dispatch' && inputs.sign == true }}
+      # push 一律签名；workflow_dispatch 看 inputs.sign（默认 true）。签名路径缺 secret 仍直接失败，不回退。
+      DSH_CI_MAC_SIGN: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.sign == true) }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v7.0.1

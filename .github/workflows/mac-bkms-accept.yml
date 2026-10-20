@@ -57,9 +57,11 @@ jobs:
           xcrun stapler validate "$DMG" 2>&1 | tee stapler.txt
 
           echo '--- extract app.asar ---'
-          npm pack @electron/asar@3.4.1 --pack-destination /tmp >/dev/null
-          mkdir -p /tmp/asar-pkg && tar -xzf /tmp/electron-asar-*.tgz -C /tmp/asar-pkg
-          ASAR_JS=/tmp/asar-pkg/package/bin/asar.js
+          # npm pack 不含依赖；装进临时目录再抽 asar（解包工具本身可用 runner npm，脚本验收仍用包内 Node）。
+          mkdir -p /tmp/asar-install
+          npm install --prefix /tmp/asar-install --no-save --no-fund --no-audit @electron/asar@3.4.1
+          ASAR_JS=/tmp/asar-install/node_modules/@electron/asar/bin/asar.js
+          test -f "$ASAR_JS"
           # 包内 primary-runtime Node（与 Desktop 自带 runtime 一致）；禁止用 runner 系统 node 跑脚本验收。
           NODE_BIN="$APP/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
           test -x "$NODE_BIN"

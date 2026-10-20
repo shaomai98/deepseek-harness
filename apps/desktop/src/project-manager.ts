@@ -31,6 +31,9 @@ const DSH_PACKAGE = '@deepseek-ai/dsh'
 const CORE_BUILD_PACKAGE = '@deepseek-ai/dsh-subprocess-local'
 const WEB_PROFILE = PROFILE_TEMPLATES.web as ProfileTemplate
 const WORKSPACE_SETTINGS = 'nodeLinker: hoisted\nautoInstallPeers: false\n'
+// bkms: one-shot default-enable marker and installation package name.
+const BKMS_BUNDLE = '@bkms/bundle'
+const BKMS_SEEDED_MARKER = '.bkms-seeded'
 function writeJson(path: string, value: unknown): void {
   writeFileSync(path, `${JSON.stringify(value, undefined, 2)}\n`, { mode: 0o600 })
 }
@@ -55,6 +58,26 @@ function migrateProfileSettings(projectDir: string): void {
   if (readFileSync(path, 'utf8').replaceAll('\r\n', '\n') === legacy) {
     writeFileSync(path, workspaceFile())
   }
+}
+
+// bkms: one-shot migration — append @bkms/bundle to dsh.profile.bundles when the installer
+// ships it. The marker prevents re-enable after the user turns the bundle off.
+function seedBkmsBundleIfNeeded(projectDir: string, runtimeDsh: string): void {
+  if (!existsSync(join(runtimeDsh, 'node_modules', BKMS_BUNDLE, 'package.json'))) return
+  const marker = join(projectDir, BKMS_SEEDED_MARKER)
+  if (existsSync(marker)) return
+  const manifestPath = join(projectDir, 'package.json')
+  if (!existsSync(manifestPath)) return
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    dsh?: { profile?: { bundles?: string[] } }
+  }
+  const bundles = manifest.dsh?.profile?.bundles
+  if (!Array.isArray(bundles)) return
+  if (!bundles.includes(BKMS_BUNDLE)) {
+    bundles.push(BKMS_BUNDLE)
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, undefined, 2)}\n`, { mode: 0o600 })
+  }
+  writeFileSync(marker, '', { mode: 0o600 })
 }
 
 /** Initializes the Desktop profile and disables third-party bundles during recovery. */
@@ -86,6 +109,8 @@ export class DesktopProjectManager {
       readDesktopRuntime(this.runtime.dsh)
       migrateProfileSettings(this.paths.profile)
       createPluginProfile(this.paths.profile)
+      // bkms: run after initProfile so new and existing profiles both get the one-shot enable.
+      seedBkmsBundleIfNeeded(this.paths.profile, this.runtime.dsh)
       removeLinkProjections(this.paths.profile)
     })
   }

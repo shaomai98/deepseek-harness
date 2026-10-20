@@ -88,7 +88,7 @@ jobs:
           "$NODE_BIN" scripts/ci/mac-bkms-accept.mjs
       - name: 上传验收日志
         if: always()
-        uses: actions/upload-artifact@v8.0.1
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: mac-bkms-accept-logs-${{ github.run_id }}
           path: |

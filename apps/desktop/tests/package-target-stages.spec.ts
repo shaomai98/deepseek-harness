@@ -1,6 +1,6 @@
 import { writeFileSync } from 'node:fs'
-import { afterEach, expect, it, vi } from 'vitest'
-import { packageTarget, parseDesktopPackageInvocation } from '../scripts/package-target.ts'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { injectBkmsBundleIntoDesktopPack, packageTarget, parseDesktopPackageInvocation } from '../scripts/package-target.ts'
 import { withMacOSNotarizationProxy } from '../scripts/macos-notarization-proxy.ts'
 import { packageMacOSArtifacts } from '../scripts/package-macos.ts'
 import { withWindowsSigningStage } from '../scripts/windows-signing-stage.mjs'
@@ -26,6 +26,10 @@ vi.mock('node:fs', async importOriginal => ({
   rmSync: vi.fn(), mkdirSync: vi.fn(), writeFileSync: vi.fn(), renameSync: vi.fn(),
 }))
 
+beforeEach(() => {
+  // Ambient DSH_BKMS_XBUDDY_TGZ must not engage the real packed-vendor inject path in this suite.
+  vi.stubEnv('DSH_BKMS_XBUDDY_TGZ', '')
+})
 afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks() })
 
 const environment = { DSH_DESKTOP_APP_ID: 'com.example.test', DSH_DESKTOP_AUTO_UPDATE_ENV: 'test',
@@ -220,4 +224,12 @@ it('fails debugging packages when runtime verification fails', async () => {
     .rejects.toThrow('stage refused')
   expect(stages.at(-1)).toBe(failure)
   expect(writeFileSync).not.toHaveBeenCalled()
+})
+
+// bkms: set-but-missing XBuddy tgz must fail packaging, not skip.
+it('throws when DSH_BKMS_XBUDDY_TGZ is set but the file is missing', () => {
+  const missing = '/tmp/dsh-bkms-accept-missing-xbuddy-does-not-exist.tgz'
+  vi.stubEnv('DSH_BKMS_XBUDDY_TGZ', missing)
+  expect(() => injectBkmsBundleIntoDesktopPack('/tmp/packed-dsh-fixture', '/tmp/packed-vendor-fixture'))
+    .toThrow(`desktop package: bkms DSH_BKMS_XBUDDY_TGZ is set but file is missing: ${missing}`)
 })

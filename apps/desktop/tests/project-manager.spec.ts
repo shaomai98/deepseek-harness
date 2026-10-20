@@ -251,6 +251,80 @@ describe('desktop external plugin profile', () => {
   })
 })
 
+// bkms: one-shot default-enable migration for @bkms/bundle
+describe('bkms default-enable migration', () => {
+  const BKMS_BUNDLE = '@bkms/bundle'
+  const MARKER = '.bkms-seeded'
+
+  function installBkms(runtimeDsh: string): void {
+    const dir = join(runtimeDsh, 'node_modules', BKMS_BUNDLE)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      name: BKMS_BUNDLE, version: '0.1.2', dsh: { bundle: { patch: './bundle.yml' } },
+    }))
+    writeFileSync(join(dir, 'bundle.yml'), '[]\n')
+  }
+
+  function profileBundles(manager: DesktopProjectManager): string[] {
+    return (JSON.parse(readFileSync(join(manager.paths.profile, 'package.json'), 'utf8')) as {
+      dsh: { profile: { bundles: string[] } }
+    }).dsh.profile.bundles
+  }
+
+  it('enables @bkms/bundle on first applyRelease when the installer ships it', async () => {
+    const { manager } = setup()
+    installBkms(manager.runtime.dsh)
+    await manager.applyRelease()
+    expect(profileBundles(manager)).toContain(BKMS_BUNDLE)
+    expect(existsSync(join(manager.paths.profile, MARKER))).toBe(true)
+  })
+
+  it('is idempotent: a second applyRelease does not change bundles or rewrite the marker', async () => {
+    const { manager } = setup()
+    installBkms(manager.runtime.dsh)
+    await manager.applyRelease()
+    const before = readFileSync(join(manager.paths.profile, 'package.json'), 'utf8')
+    const markerBefore = readFileSync(join(manager.paths.profile, MARKER))
+    await manager.applyRelease()
+    expect(readFileSync(join(manager.paths.profile, 'package.json'), 'utf8')).toBe(before)
+    expect(readFileSync(join(manager.paths.profile, MARKER))).toEqual(markerBefore)
+    expect(profileBundles(manager).filter(name => name === BKMS_BUNDLE)).toHaveLength(1)
+  })
+
+  it('does not re-enable after the user removes @bkms/bundle from the profile', async () => {
+    const { manager } = setup()
+    installBkms(manager.runtime.dsh)
+    await manager.applyRelease()
+    const path = join(manager.paths.profile, 'package.json')
+    const manifest = JSON.parse(readFileSync(path, 'utf8')) as { dsh: { profile: { bundles: string[] } } }
+    manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter(name => name !== BKMS_BUNDLE)
+    writeFileSync(path, `${JSON.stringify(manifest, undefined, 2)}\n`)
+    await manager.applyRelease()
+    expect(profileBundles(manager)).not.toContain(BKMS_BUNDLE)
+    expect(existsSync(join(manager.paths.profile, MARKER))).toBe(true)
+  })
+
+  it('leaves the profile untouched when the installer has no @bkms/bundle', async () => {
+    const { manager } = setup()
+    await manager.applyRelease()
+    expect(profileBundles(manager)).not.toContain(BKMS_BUNDLE)
+    expect(existsSync(join(manager.paths.profile, MARKER))).toBe(false)
+    const before = readFileSync(join(manager.paths.profile, 'package.json'), 'utf8')
+    await manager.applyRelease()
+    expect(readFileSync(join(manager.paths.profile, 'package.json'), 'utf8')).toBe(before)
+  })
+
+  it('enables @bkms/bundle for an existing profile that predates the migration', async () => {
+    const { manager } = setup()
+    await manager.applyRelease()
+    expect(profileBundles(manager)).not.toContain(BKMS_BUNDLE)
+    installBkms(manager.runtime.dsh)
+    await manager.applyRelease()
+    expect(profileBundles(manager)).toContain(BKMS_BUNDLE)
+    expect(existsSync(join(manager.paths.profile, MARKER))).toBe(true)
+  })
+})
+
 describe.each(['applyRelease', 'disableAllPlugins'] as const)('desktop profile lock during %s', (operation) => {
   it('preserves a live owner lock and leaves the profile untouched', async () => {
     const { manager } = setup()

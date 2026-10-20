@@ -3,6 +3,13 @@ name: build-desktop
 # 手动运行，或把会影响安装包的改动推到 dev 时运行。
 on:
   workflow_dispatch:
+    inputs:
+      # 仅手动运行可开；push 触发一律走未签名路径。
+      sign:
+        description: 'macOS 是否签名并公证（默认否；push 触发忽略此输入、一律不签名）'
+        type: boolean
+        default: false
+        required: true
   push:
     branches: [dev]
     # 文档、许可证、编辑器配置和其他工作流不触发。本文件放在最后，避免被前面的忽略规则挡住。
@@ -36,7 +43,8 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
-    # Mac 只做签名公证。Windows 做未签名包。一台失败不拖垮另一台。
+    # Mac：push / sign=false 走已有 --unsigned 路径；仅 workflow_dispatch 且 sign=true 时签名公证。
+    # Windows：始终未签名。一台失败不拖垮另一台。
     strategy:
       fail-fast: false
       matrix:
@@ -44,9 +52,10 @@ jobs:
           - os: macos-latest
             name: macos-arm64
             shell: bash
-            artifact: macos-arm64-signed
-            package: package:desktop:mac:arm64
-            globs: apps/desktop/.desktop-build/targets/mac-arm64/artifacts/*.dmg apps/desktop/.desktop-build/targets/mac-arm64/artifacts/*.zip
+            # 下列 mac 字段在「选择 mac 打包模式」步骤按是否签名覆盖。
+            artifact: macos-arm64-unsigned
+            package: package:desktop:mac:arm64:unsigned
+            globs: apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/*.dmg apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/*.zip
           - os: windows-latest
             name: windows-x64
             shell: pwsh
@@ -58,6 +67,8 @@ jobs:
         shell: ${{ matrix.shell }}
     env:
       DSH_TELEMETRY_DISABLED: '1'
+      # 默认：仅 workflow_dispatch 且 sign=true。签名路径缺 secret 仍直接失败，不回退。
+      DSH_CI_MAC_SIGN: ${{ github.event_name == 'workflow_dispatch' && inputs.sign == true }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v7.0.1
@@ -76,10 +87,135 @@ jobs:
           cache: pnpm
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
-      # 五个密钥缺任何一个就列出名字并失败。齐全则从证书读出签名身份，写进 .env.macos。
+      # —— bmks：在 frozen-lockfile 之外拉私有库现场 build+pack，不进 DSH 依赖图 ——
+      # 检出 bmks 默认分支最新代码（只读 Deploy Key）。
+      - name: 检出 bmks
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: shaomai98/dsh-bkms
+          ref: main
+          path: .ci/dsh-bkms
+          ssh-key: ${{ secrets.BMKS_DEPLOY_KEY }}
+          persist-credentials: false
+      # 打印本次 bmks 提交，便于安装包追溯。
+      - name: 打印 bmks 提交
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git -C .ci/dsh-bkms rev-parse HEAD)
+          echo "bmks commit: $sha"
+          echo "BMKS_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
+      # 用 bmks 自己的工具链 install / build / pack，产出 XBuddy tgz，路径写入环境变量。
+      - name: 构建并打包 XBuddy
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/.ci/dsh-bkms"
+          cd "$root"
+          echo '--- bmks package.json ---'
+          cat package.json
+          if [[ -f pnpm-workspace.yaml ]]; then echo '--- pnpm-workspace.yaml ---'; cat pnpm-workspace.yaml; fi
+          # 发现 packageManager / 脚本：优先用仓库声明的 pnpm，否则沿用 runner 上已装的 pnpm。
+          pm=$(node -p "try{require('./package.json').packageManager||''}catch{''}")
+          if [[ "$pm" == pnpm@* ]]; then
+            echo "bmks packageManager: $pm"
+            corepack enable
+            corepack prepare "$pm" --activate
+          else
+            echo "bmks packageManager 未声明 pnpm，使用 runner 默认 pnpm"
+          fi
+          pnpm --version
+          # 安装 bmks 自己的依赖（与 DSH frozen-lockfile 无关）。
+          if [[ -f pnpm-lock.yaml ]]; then
+            pnpm install --frozen-lockfile
+          else
+            pnpm install
+          fi
+          # 有 build 就先 build。
+          if node -e "const s=require('./package.json').scripts||{}; process.exit(s.build?0:1)"; then
+            pnpm run build
+          fi
+          # 打包：优先 pack:bundle，其次 filter @bkms/bundle pack，再退回根 pack。
+          rm -f "$root"/XBuddy-*.tgz "$root"/*.tgz "$root"/packages/bundle/*.tgz 2>/dev/null || true
+          if node -e "const s=require('./package.json').scripts||{}; process.exit(s['pack:bundle']?0:1)"; then
+            pnpm run pack:bundle
+          elif [[ -f packages/bundle/package.json ]]; then
+            pnpm --filter @bkms/bundle pack --pack-destination "$root"
+          else
+            pnpm pack
+          fi
+          # 选出本次产出的 tgz（优先 XBuddy-*.tgz，其次 package name 为 @bkms/bundle）。
+          # 读 tgz 内 package.json：先 cd 到目录再用相对路径，避免 Windows 上 GNU tar 把 D:\ 当远程主机。
+          read_tgz_package_json() {
+            local archive="$1"
+            (cd "$(dirname "$archive")" && tar -xOzf "$(basename "$archive")" package/package.json)
+          }
+          tgzs=()
+          while IFS= read -r f; do [[ -n "$f" ]] && tgzs+=("$f"); done < <(find "$root" -type f -name '*.tgz' ! -path '*/node_modules/*' | LC_ALL=C sort)
+          [[ ${#tgzs[@]} -gt 0 ]] || { echo 'bmks: 未产出任何 .tgz' >&2; find "$root" -maxdepth 3 -type f | head -100 >&2; exit 1; }
+          pick=""
+          for f in "${tgzs[@]}"; do
+            case "$(basename "$f")" in XBuddy-*.tgz) pick="$f"; break ;; esac
+          done
+          if [[ -z "$pick" ]]; then
+            for f in "${tgzs[@]}"; do
+              name=$(read_tgz_package_json "$f" 2>/dev/null | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).name" || true)
+              if [[ "$name" == "@bkms/bundle" ]]; then pick="$f"; break; fi
+            done
+          fi
+          [[ -n "$pick" ]] || pick="${tgzs[0]}"
+          echo "bmks packed: $pick"
+          manifest=$(mktemp)
+          read_tgz_package_json "$pick" > "$manifest"
+          cat "$manifest"
+          node -e "const m=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')); if(m.name!=='@bkms/bundle'){console.error('expected @bkms/bundle, got',m.name); process.exit(1)}; console.log('ok',m.name,m.version)" "$manifest"
+          # 交给后续打包步骤：package-target.ts 读此变量拷进 packedVendor。
+          echo "DSH_BKMS_XBUDDY_TGZ=$pick" >> "$GITHUB_ENV"
+      # 按 DSH_CI_MAC_SIGN 选择已有 signed / --unsigned 打包脚本与产物目录（复用 package-target 的 unsigned-artifacts）。
+      - name: 选择 mac 打包模式
+        id: mac-pack
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${DSH_CI_MAC_SIGN}" == "true" ]]; then
+            echo 'mac: 签名+公证（package:desktop:mac:arm64 → artifacts/）'
+            {
+              echo 'package=package:desktop:mac:arm64'
+              echo 'artifact=macos-arm64-signed'
+              echo 'globs=apps/desktop/.desktop-build/targets/mac-arm64/artifacts/*.dmg apps/desktop/.desktop-build/targets/mac-arm64/artifacts/*.zip'
+              echo 'sign=true'
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo 'mac: 未签名（package:desktop:mac:arm64:unsigned → unsigned-artifacts/）'
+            {
+              echo 'package=package:desktop:mac:arm64:unsigned'
+              echo 'artifact=macos-arm64-unsigned'
+              echo 'globs=apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/*.dmg apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/*.zip'
+              echo 'sign=false'
+            } >> "$GITHUB_OUTPUT"
+          fi
+      # 未签名 mac：不导入证书、不查签名 secret；--unsigned 走 localMacOSPackageEnvironment，可不写 .env.macos。
+      # 仍写一份无证书的 .env.macos，便于本地对照与日志步骤识别。
+      - name: 写入 macOS 未签名配置
+        id: settings-macos-unsigned
+        if: runner.os == 'macOS' && steps.mac-pack.outputs.sign == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > apps/desktop/.env.macos <<'EOF'
+          DSH_DESKTOP_APP_ID=com.deepseek.harness
+          DSH_DESKTOP_AUTO_UPDATE_ENV=test
+          DOWNLOAD_TEST_ORIGIN=https://example.com
+          DOWNLOAD_TEST_RELEASE_ID=00000000000000000000000000000000
+          DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://example.com
+          DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='{"allowedAuthOrigins":["https://example.com"]}'
+          EOF
+          echo 'mac unsigned: skipped Apple cert import, signing, notarization, and signing-secret checks'
+      # 签名 mac：五个密钥缺任何一个就列出名字并失败，绝不回退未签名。齐全则从证书读出签名身份，写进 .env.macos。
       - name: 写入 macOS 签名配置
         id: settings
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && steps.mac-pack.outputs.sign == 'true'
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
@@ -132,31 +268,44 @@ jobs:
           DSH_DESKTOP_WINDOWS_PACK_CONCURRENCY=4
           '@
           Set-Content -Path apps/desktop/.env.windows -Value $content -Encoding ascii
-      # Mac 打已签名并公证的包。Windows 打未签名安装包。都不发布更新。
+      # Mac：按「选择 mac 打包模式」输出调用 signed 或 --unsigned 脚本。Windows 仍用 matrix 未签名脚本。
       - name: 打包
-        run: pnpm run ${{ matrix.package }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            pnpm run "${{ steps.mac-pack.outputs.package }}"
+          else
+            pnpm run ${{ matrix.package }}
+          fi
       - name: 收集安装包
         if: success()
         shell: bash
         run: |
+          set -euo pipefail
           stage="$RUNNER_TEMP/fork-desktop-artifacts"
           [[ "$RUNNER_OS" == "Windows" ]] && stage="$(cygpath -u "$RUNNER_TEMP")/fork-desktop-artifacts"
           mkdir -p "$stage"
           shopt -s nullglob
-          files=(${{ matrix.globs }})
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            files=(${{ steps.mac-pack.outputs.globs }})
+          else
+            files=(${{ matrix.globs }})
+          fi
           [[ ${#files[@]} -gt 0 ]] || { echo 'fork desktop package: no installer was produced' >&2; exit 1; }
           cp "${files[@]}" "$stage/"
+          ls -la "$stage"
       - name: 上传安装包
         if: success()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: ${{ matrix.artifact }}-${{ github.run_id }}
+          name: ${{ runner.os == 'macOS' && steps.mac-pack.outputs.artifact || matrix.artifact }}-${{ github.run_id }}
           path: ${{ runner.temp }}/fork-desktop-artifacts/
           if-no-files-found: error
           retention-days: 14
       # 配置写成功后，无论打包成败都留下日志。
       - name: 上传打包日志
-        if: always() && (steps.settings.outcome == 'success' || steps.settings-windows.outcome == 'success')
+        if: always() && (steps.settings.outcome == 'success' || steps.settings-macos-unsigned.outcome == 'success' || steps.settings-windows.outcome == 'success')
         uses: actions/upload-artifact@v7.0.1
         with:
           name: fork-package-logs-${{ matrix.name }}-${{ github.run_id }}

@@ -1,10 +1,11 @@
 # 在 GitHub 托管的 Mac 和 Windows 上打桌面安装包。不改 master，也不发布更新。
 name: build-desktop
-# 手动运行，或把会影响安装包的改动推到 dev 时运行。
+# 手动运行，或把会影响安装包的改动推到 dev / bkms/step0-verify 时运行。
+# bkms/step0-verify：第 0 步验证分支，临时加入触发；验证结束后可删。
 on:
   workflow_dispatch:
   push:
-    branches: [dev]
+    branches: [dev, bkms/step0-verify]
     # 文档、许可证、编辑器配置和其他工作流不触发。本文件放在最后，避免被前面的忽略规则挡住。
     paths:
       - '**'
@@ -76,6 +77,85 @@ jobs:
           cache: pnpm
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
+      # —— bmks：在 frozen-lockfile 之外拉私有库现场 build+pack，不进 DSH 依赖图 ——
+      # 检出 bmks 默认分支最新代码（只读 Deploy Key）。
+      - name: 检出 bmks
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: shaomai98/dsh-bkms
+          ref: main
+          path: .ci/dsh-bkms
+          ssh-key: ${{ secrets.BMKS_DEPLOY_KEY }}
+          persist-credentials: false
+      # 打印本次 bmks 提交，便于安装包追溯。
+      - name: 打印 bmks 提交
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git -C .ci/dsh-bkms rev-parse HEAD)
+          echo "bmks commit: $sha"
+          echo "BMKS_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
+      # 用 bmks 自己的工具链 install / build / pack，产出 XBuddy tgz，路径写入环境变量。
+      - name: 构建并打包 XBuddy
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/.ci/dsh-bkms"
+          cd "$root"
+          echo '--- bmks package.json ---'
+          cat package.json
+          if [[ -f pnpm-workspace.yaml ]]; then echo '--- pnpm-workspace.yaml ---'; cat pnpm-workspace.yaml; fi
+          # 发现 packageManager / 脚本：优先用仓库声明的 pnpm，否则沿用 runner 上已装的 pnpm。
+          pm=$(node -p "try{require('./package.json').packageManager||''}catch{''}")
+          if [[ "$pm" == pnpm@* ]]; then
+            echo "bmks packageManager: $pm"
+            corepack enable
+            corepack prepare "$pm" --activate
+          else
+            echo "bmks packageManager 未声明 pnpm，使用 runner 默认 pnpm"
+          fi
+          pnpm --version
+          # 安装 bmks 自己的依赖（与 DSH frozen-lockfile 无关）。
+          if [[ -f pnpm-lock.yaml ]]; then
+            pnpm install --frozen-lockfile
+          else
+            pnpm install
+          fi
+          # 有 build 就先 build。
+          if node -e "const s=require('./package.json').scripts||{}; process.exit(s.build?0:1)"; then
+            pnpm run build
+          fi
+          # 打包：优先 pack:bundle，其次 filter @bkms/bundle pack，再退回根 pack。
+          rm -f "$root"/XBuddy-*.tgz "$root"/*.tgz "$root"/packages/bundle/*.tgz 2>/dev/null || true
+          if node -e "const s=require('./package.json').scripts||{}; process.exit(s['pack:bundle']?0:1)"; then
+            pnpm run pack:bundle
+          elif [[ -f packages/bundle/package.json ]]; then
+            pnpm --filter @bkms/bundle pack --pack-destination "$root"
+          else
+            pnpm pack
+          fi
+          # 选出本次产出的 tgz（优先 XBuddy-*.tgz，其次 package name 为 @bkms/bundle）。
+          tgzs=()
+          while IFS= read -r f; do [[ -n "$f" ]] && tgzs+=("$f"); done < <(find "$root" -type f -name '*.tgz' ! -path '*/node_modules/*' | LC_ALL=C sort)
+          [[ ${#tgzs[@]} -gt 0 ]] || { echo 'bmks: 未产出任何 .tgz' >&2; find "$root" -maxdepth 3 -type f | head -100 >&2; exit 1; }
+          pick=""
+          for f in "${tgzs[@]}"; do
+            case "$(basename "$f")" in XBuddy-*.tgz) pick="$f"; break ;; esac
+          done
+          if [[ -z "$pick" ]]; then
+            for f in "${tgzs[@]}"; do
+              name=$(tar -xOzf "$f" package/package.json 2>/dev/null | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).name" || true)
+              if [[ "$name" == "@bkms/bundle" ]]; then pick="$f"; break; fi
+            done
+          fi
+          [[ -n "$pick" ]] || pick="${tgzs[0]}"
+          echo "bmks packed: $pick"
+          manifest=$(mktemp)
+          tar -xOzf "$pick" package/package.json > "$manifest"
+          cat "$manifest"
+          node -e "const m=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')); if(m.name!=='@bkms/bundle'){console.error('expected @bkms/bundle, got',m.name); process.exit(1)}; console.log('ok',m.name,m.version)" "$manifest"
+          # 交给后续打包步骤：package-target.ts 读此变量拷进 packedVendor。
+          echo "DSH_BKMS_XBUDDY_TGZ=$pick" >> "$GITHUB_ENV"
       # 五个密钥缺任何一个就列出名字并失败。齐全则从证书读出签名身份，写进 .env.macos。
       - name: 写入 macOS 签名配置
         id: settings

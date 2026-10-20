@@ -1,9 +1,9 @@
 /** Build one release target with matching Electron and dsh architecture. */
 
 import { spawn } from 'node:child_process'
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { parseArgs } from 'node:util'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import {
   desktopBuildRecordFilename,
   resolveDesktopAutoUpdateConfig,
@@ -486,6 +486,17 @@ export async function packageTarget(
     buildPaths.packedDsh,
   ], buildEnv, REPOSITORY_ROOT)
   await execute(['run', 'release:pack', '--family', 'vendor', '--out', buildPaths.packedVendor, ...packArguments], buildEnv, REPOSITORY_ROOT)
+  // bkms: CI 注入的 XBuddy tgz → packedVendor，供 prepare-package-set 按包名收集；不进 DSH lockfile。
+  const bkmsXbuddyTgz = process.env.DSH_BKMS_XBUDDY_TGZ?.trim()
+  if (bkmsXbuddyTgz !== undefined && bkmsXbuddyTgz !== '') {
+    if (!existsSync(bkmsXbuddyTgz)) {
+      throw new Error(`desktop package: bkms XBuddy tgz missing: ${bkmsXbuddyTgz}`)
+    }
+    mkdirSync(buildPaths.packedVendor, { recursive: true })
+    const destination = join(buildPaths.packedVendor, basename(bkmsXbuddyTgz))
+    copyFileSync(bkmsXbuddyTgz, destination)
+    process.stdout.write(`desktop package: bkms copied ${bkmsXbuddyTgz} -> ${destination}\n`)
+  }
   rmSync(buildPaths.packedLandlock, { recursive: true, force: true })
   mkdirSync(buildPaths.packedLandlock, { recursive: true })
   await execute(['--dir', 'native/system', 'run', 'build:ts'], buildEnv, REPOSITORY_ROOT)

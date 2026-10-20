@@ -8,6 +8,7 @@ import {
 import { tmpdir } from 'node:os'
 import { parseArgs } from 'node:util'
 import { basename, dirname, join, resolve } from 'node:path'
+import { satisfies, valid } from 'semver'
 import { packedManifest } from '../../../scripts/release/tarball.ts'
 import {
   desktopBuildRecordFilename,
@@ -314,25 +315,113 @@ function runTarBesideArchive(
   return result.stdout
 }
 
+/** One packed npm tarball indexed by package name for bkms peer checks. */
+interface PackedPackageIndexEntry {
+  readonly path: string
+  readonly version: string
+  readonly manifest: Readonly<Record<string, unknown>>
+}
+
+/**
+ * Index every `.tgz` under the given pack output directories by package name.
+ * @param directories - `packedDsh` / `packedVendor` style directories.
+ * @returns Map of package name → packed identity.
+ */
+function indexPackedTarballs(directories: readonly string[]): Map<string, PackedPackageIndexEntry> {
+  const index = new Map<string, PackedPackageIndexEntry>()
+  for (const directory of directories) {
+    if (!existsSync(directory)) continue
+    for (const file of readdirSync(directory).filter(name => name.endsWith('.tgz')).sort()) {
+      const path = join(directory, file)
+      const manifest = packedManifest(path)
+      const name = manifest.name
+      const version = manifest.version
+      if (typeof name !== 'string' || name === '' || typeof version !== 'string' || version === '') {
+        throw new Error(`desktop package: packed tarball ${path} lacks name/version`)
+      }
+      const previous = index.get(name)
+      if (previous !== undefined) {
+        throw new Error(`desktop package: duplicate packed ${name}: ${previous.path} and ${path}`)
+      }
+      index.set(name, { path, version, manifest })
+    }
+  }
+  return index
+}
+
 /**
  * Locate the unique packed tarball whose `package/package.json` names `packageName`.
- * @param directory - Directory of `.tgz` inputs.
+ * @param index - Packed tarball index.
  * @param packageName - Expected `name` field.
  * @returns Absolute tarball path.
  */
-function findPackedTarballByName(directory: string, packageName: string): string {
-  const matches = readdirSync(directory)
-    .filter(file => file.endsWith('.tgz'))
-    .sort()
-    .map(file => join(directory, file))
-    .filter(path => packedManifest(path).name === packageName)
-  if (matches.length === 0) {
-    throw new Error(`desktop package: packed inputs omit ${packageName} under ${directory}`)
+function findPackedTarballByName(index: ReadonlyMap<string, PackedPackageIndexEntry>, packageName: string): string {
+  const entry = index.get(packageName)
+  if (entry === undefined) {
+    throw new Error(`desktop package: packed inputs omit ${packageName}`)
   }
-  if (matches.length > 1) {
-    throw new Error(`desktop package: duplicate packed ${packageName}: ${matches.join(', ')}`)
+  return entry.path
+}
+
+/**
+ * Walk the packed dependency / peer / optional graph rooted at `@deepseek-ai/dsh`.
+ * @param index - Packed tarball index.
+ * @returns Package name → version for every reachable packed package.
+ */
+function packedDshClosureVersions(index: ReadonlyMap<string, PackedPackageIndexEntry>): Map<string, string> {
+  const versions = new Map<string, string>()
+  const visit = (name: string): void => {
+    if (versions.has(name)) return
+    const packed = index.get(name)
+    if (packed === undefined) return
+    versions.set(name, packed.version)
+    for (const section of ['dependencies', 'peerDependencies', 'optionalDependencies'] as const) {
+      const value = packed.manifest[section]
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) continue
+      for (const dependency of Object.keys(value as Record<string, unknown>)) visit(dependency)
+    }
   }
-  return matches[0]!
+  visit('@deepseek-ai/dsh')
+  return versions
+}
+
+/**
+ * Resolve the version this packaging run actually ships for one `@deepseek-ai/*` peer.
+ * Prefers the packed tarball's own version; falls back to the dsh packed closure.
+ * @param name - Peer package name.
+ * @param packed - Packed tarball index.
+ * @param closure - Versions reachable from packed `@deepseek-ai/dsh`.
+ * @returns Actual version and a short provenance label.
+ */
+function resolveBkmsPeerActualVersion(
+  name: string,
+  packed: ReadonlyMap<string, PackedPackageIndexEntry>,
+  closure: ReadonlyMap<string, string>,
+): { version: string; source: string } {
+  const direct = packed.get(name)
+  if (direct !== undefined) {
+    return { version: direct.version, source: `packed tarball ${basename(direct.path)}` }
+  }
+  const fromClosure = closure.get(name)
+  if (fromClosure !== undefined) {
+    return { version: fromClosure, source: 'packed @deepseek-ai/dsh dependency closure' }
+  }
+  throw new Error(
+    `desktop package: bkms peerDependency ${name} is not in this packaging run's packed tarballs or dsh closure`,
+  )
+}
+
+/**
+ * Whether a peerDependency declaration accepts the version this run packs.
+ * Exact versions use string equality; ranges use `semver.satisfies` with prereleases included.
+ * @param actual - Version present in this packaging run.
+ * @param peer - PeerDependency value from XBuddy.
+ * @returns True when the peer accepts `actual`.
+ */
+function bkmsPeerAcceptsVersion(actual: string, peer: string): boolean {
+  if (actual === peer) return true
+  if (valid(peer) !== null) return false
+  return satisfies(actual, peer, { includePrerelease: true })
 }
 
 /**
@@ -402,20 +491,22 @@ export function injectBkmsBundleIntoDesktopPack(packedDsh: string, packedVendor:
   }
   const bundleVersion = xbuddy.version
 
-  const dshTarball = findPackedTarballByName(packedDsh, '@deepseek-ai/dsh')
-  const dshManifest = packedManifest(dshTarball)
-  if (typeof dshManifest.version !== 'string' || dshManifest.version === '') {
-    throw new Error('desktop package: packed @deepseek-ai/dsh has no version')
-  }
-  const dshVersion = dshManifest.version
+  const packedIndex = indexPackedTarballs([packedDsh, packedVendor])
+  const dshTarball = findPackedTarballByName(packedIndex, '@deepseek-ai/dsh')
+  const closureVersions = packedDshClosureVersions(packedIndex)
 
   const peers = xbuddy.peerDependencies
   if (peers !== null && typeof peers === 'object' && !Array.isArray(peers)) {
-    for (const [name, range] of Object.entries(peers as Record<string, unknown>)) {
+    for (const [name, peerValue] of Object.entries(peers as Record<string, unknown>)) {
       if (!name.startsWith('@deepseek-ai/')) continue
-      if (range !== dshVersion) {
+      if (typeof peerValue !== 'string' || peerValue === '') {
+        throw new Error(`desktop package: bkms peerDependency ${name} must be a non-empty string`)
+      }
+      const actual = resolveBkmsPeerActualVersion(name, packedIndex, closureVersions)
+      if (!bkmsPeerAcceptsVersion(actual.version, peerValue)) {
         throw new Error(
-          `desktop package: bkms peerDependency ${name} must equal DSH ${dshVersion}, got ${String(range)}`,
+          `desktop package: bkms peerDependency ${name} expected ${JSON.stringify(peerValue)}, `
+          + `actual ${JSON.stringify(actual.version)} (from ${actual.source})`,
         )
       }
     }

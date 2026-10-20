@@ -137,6 +137,11 @@ jobs:
             pnpm pack
           fi
           # 选出本次产出的 tgz（优先 XBuddy-*.tgz，其次 package name 为 @bkms/bundle）。
+          # 读 tgz 内 package.json：先 cd 到目录再用相对路径，避免 Windows 上 GNU tar 把 D:\ 当远程主机。
+          read_tgz_package_json() {
+            local archive="$1"
+            (cd "$(dirname "$archive")" && tar -xOzf "$(basename "$archive")" package/package.json)
+          }
           tgzs=()
           while IFS= read -r f; do [[ -n "$f" ]] && tgzs+=("$f"); done < <(find "$root" -type f -name '*.tgz' ! -path '*/node_modules/*' | LC_ALL=C sort)
           [[ ${#tgzs[@]} -gt 0 ]] || { echo 'bmks: 未产出任何 .tgz' >&2; find "$root" -maxdepth 3 -type f | head -100 >&2; exit 1; }
@@ -146,14 +151,14 @@ jobs:
           done
           if [[ -z "$pick" ]]; then
             for f in "${tgzs[@]}"; do
-              name=$(tar -xOzf "$f" package/package.json 2>/dev/null | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).name" || true)
+              name=$(read_tgz_package_json "$f" 2>/dev/null | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).name" || true)
               if [[ "$name" == "@bkms/bundle" ]]; then pick="$f"; break; fi
             done
           fi
           [[ -n "$pick" ]] || pick="${tgzs[0]}"
           echo "bmks packed: $pick"
           manifest=$(mktemp)
-          tar -xOzf "$pick" package/package.json > "$manifest"
+          read_tgz_package_json "$pick" > "$manifest"
           cat "$manifest"
           node -e "const m=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')); if(m.name!=='@bkms/bundle'){console.error('expected @bkms/bundle, got',m.name); process.exit(1)}; console.log('ok',m.name,m.version)" "$manifest"
           # 交给后续打包步骤：package-target.ts 读此变量拷进 packedVendor。

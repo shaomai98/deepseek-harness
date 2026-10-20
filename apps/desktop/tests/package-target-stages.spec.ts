@@ -1,5 +1,5 @@
 import { writeFileSync } from 'node:fs'
-import { afterEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { packageTarget, parseDesktopPackageInvocation } from '../scripts/package-target.ts'
 import { withMacOSNotarizationProxy } from '../scripts/macos-notarization-proxy.ts'
 import { packageMacOSArtifacts } from '../scripts/package-macos.ts'
@@ -26,6 +26,10 @@ vi.mock('node:fs', async importOriginal => ({
   rmSync: vi.fn(), mkdirSync: vi.fn(), writeFileSync: vi.fn(), renameSync: vi.fn(),
 }))
 
+beforeEach(() => {
+  // Ambient DSH_BKMS_XBUDDY_TGZ must not engage the real packed-vendor inject path in this suite.
+  vi.stubEnv('DSH_BKMS_XBUDDY_TGZ', '')
+})
 afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks() })
 
 const environment = { DSH_DESKTOP_APP_ID: 'com.example.test', DSH_DESKTOP_AUTO_UPDATE_ENV: 'test',

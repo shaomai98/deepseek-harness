@@ -1,9 +1,15 @@
 /** Build one release target with matching Electron and dsh architecture. */
 
-import { spawn } from 'node:child_process'
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import {
+  copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync,
+  renameSync, rmSync, statSync, utimesSync, writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
 import { parseArgs } from 'node:util'
-import { join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
+import { satisfies, valid } from 'semver'
+import { packedManifest } from '../../../scripts/release/tarball.ts'
 import {
   desktopBuildRecordFilename,
   resolveDesktopAutoUpdateConfig,
@@ -288,6 +294,241 @@ export function desktopElectronBuilderArguments(
   ]
 }
 
+/**
+ * Run `tar` beside the archive so Windows drive-letter paths are not treated as remote hosts.
+ * @param archive - Absolute `.tgz` path.
+ * @param args - Arguments after the archive basename handling (caller supplies `-xzf` / `-czf` forms via helper).
+ * @param options - Optional cwd override and stdin.
+ * @returns Combined stdout.
+ */
+function runTarBesideArchive(
+  archive: string,
+  args: readonly string[],
+  options: { cwd?: string } = {},
+): string {
+  const cwd = options.cwd ?? dirname(archive)
+  const result = spawnSync('tar', args, { cwd, encoding: 'utf8' })
+  if (result.error) throw result.error
+  if (result.status !== 0) {
+    throw new Error(`desktop package: tar ${args.join(' ')} failed: ${result.stderr || result.stdout || String(result.status)}`)
+  }
+  return result.stdout
+}
+
+/** One packed npm tarball indexed by package name for bkms peer checks. */
+interface PackedPackageIndexEntry {
+  readonly path: string
+  readonly version: string
+  readonly manifest: Readonly<Record<string, unknown>>
+}
+
+/**
+ * Index every `.tgz` under the given pack output directories by package name.
+ * @param directories - `packedDsh` / `packedVendor` style directories.
+ * @returns Map of package name → packed identity.
+ */
+function indexPackedTarballs(directories: readonly string[]): Map<string, PackedPackageIndexEntry> {
+  const index = new Map<string, PackedPackageIndexEntry>()
+  for (const directory of directories) {
+    if (!existsSync(directory)) continue
+    for (const file of readdirSync(directory).filter(name => name.endsWith('.tgz')).sort()) {
+      const path = join(directory, file)
+      const manifest = packedManifest(path)
+      const name = manifest.name
+      const version = manifest.version
+      if (typeof name !== 'string' || name === '' || typeof version !== 'string' || version === '') {
+        throw new Error(`desktop package: packed tarball ${path} lacks name/version`)
+      }
+      const previous = index.get(name)
+      if (previous !== undefined) {
+        throw new Error(`desktop package: duplicate packed ${name}: ${previous.path} and ${path}`)
+      }
+      index.set(name, { path, version, manifest })
+    }
+  }
+  return index
+}
+
+/**
+ * Locate the unique packed tarball whose `package/package.json` names `packageName`.
+ * @param index - Packed tarball index.
+ * @param packageName - Expected `name` field.
+ * @returns Absolute tarball path.
+ */
+function findPackedTarballByName(index: ReadonlyMap<string, PackedPackageIndexEntry>, packageName: string): string {
+  const entry = index.get(packageName)
+  if (entry === undefined) {
+    throw new Error(`desktop package: packed inputs omit ${packageName}`)
+  }
+  return entry.path
+}
+
+/**
+ * Walk the packed dependency / peer / optional graph rooted at `@deepseek-ai/dsh`.
+ * @param index - Packed tarball index.
+ * @returns Package name → version for every reachable packed package.
+ */
+function packedDshClosureVersions(index: ReadonlyMap<string, PackedPackageIndexEntry>): Map<string, string> {
+  const versions = new Map<string, string>()
+  const visit = (name: string): void => {
+    if (versions.has(name)) return
+    const packed = index.get(name)
+    if (packed === undefined) return
+    versions.set(name, packed.version)
+    for (const section of ['dependencies', 'peerDependencies', 'optionalDependencies'] as const) {
+      const value = packed.manifest[section]
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) continue
+      for (const dependency of Object.keys(value as Record<string, unknown>)) visit(dependency)
+    }
+  }
+  visit('@deepseek-ai/dsh')
+  return versions
+}
+
+/**
+ * Resolve the version this packaging run actually ships for one `@deepseek-ai/*` peer.
+ * Prefers the packed tarball's own version; falls back to the dsh packed closure.
+ * @param name - Peer package name.
+ * @param packed - Packed tarball index.
+ * @param closure - Versions reachable from packed `@deepseek-ai/dsh`.
+ * @returns Actual version and a short provenance label.
+ */
+function resolveBkmsPeerActualVersion(
+  name: string,
+  packed: ReadonlyMap<string, PackedPackageIndexEntry>,
+  closure: ReadonlyMap<string, string>,
+): { version: string; source: string } {
+  const direct = packed.get(name)
+  if (direct !== undefined) {
+    return { version: direct.version, source: `packed tarball ${basename(direct.path)}` }
+  }
+  const fromClosure = closure.get(name)
+  if (fromClosure !== undefined) {
+    return { version: fromClosure, source: 'packed @deepseek-ai/dsh dependency closure' }
+  }
+  throw new Error(
+    `desktop package: bkms peerDependency ${name} is not in this packaging run's packed tarballs or dsh closure`,
+  )
+}
+
+/**
+ * Whether a peerDependency declaration accepts the version this run packs.
+ * Exact versions use string equality; ranges use `semver.satisfies` with prereleases included.
+ * @param actual - Version present in this packaging run.
+ * @param peer - PeerDependency value from XBuddy.
+ * @returns True when the peer accepts `actual`.
+ */
+function bkmsPeerAcceptsVersion(actual: string, peer: string): boolean {
+  if (actual === peer) return true
+  if (valid(peer) !== null) return false
+  return satisfies(actual, peer, { includePrerelease: true })
+}
+
+/**
+ * Rewrite an npm pack tarball's `package/package.json` while keeping the `package/` prefix
+ * and preserving sibling entry modes/mtimes as far as `tar` extract+create allows.
+ * @param tarball - Absolute path of the tarball to replace in place.
+ * @param rewrite - Mutates the parsed manifest before it is written back.
+ */
+function rewritePackedPackageManifest(
+  tarball: string,
+  rewrite: (manifest: Record<string, unknown>) => void,
+): void {
+  const staging = mkdtempSync(join(tmpdir(), 'dsh-bkms-dsh-tgz-'))
+  try {
+    runTarBesideArchive(tarball, ['-xzf', basename(tarball), '-C', staging], { cwd: dirname(tarball) })
+    const manifestPath = join(staging, 'package', 'package.json')
+    if (!existsSync(manifestPath)) {
+      throw new Error(`desktop package: ${tarball} has no package/package.json`)
+    }
+    const previous = statSync(manifestPath)
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
+    rewrite(manifest)
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, undefined, 2)}\n`)
+    try {
+      utimesSync(manifestPath, previous.atime, previous.mtime)
+    } catch (error) {
+      // Windows and some CI filesystems refuse utimes; content correctness matters more.
+      void error
+    }
+    const temporary = join(dirname(tarball), `.${basename(tarball)}.bkms-tmp`)
+    rmSync(temporary, { force: true })
+    runTarBesideArchive(temporary, ['-czf', basename(temporary), '-C', staging, 'package'], { cwd: dirname(tarball) })
+    renameSync(temporary, tarball)
+  } finally {
+    rmSync(staging, { recursive: true, force: true })
+  }
+}
+
+/**
+ * // bkms: After `release:pack`, wire CI-built XBuddy into Desktop pack inputs without touching the repo lockfile.
+ *
+ * Copies `DSH_BKMS_XBUDDY_TGZ` into `packedVendor` and adds an exact `@bkms/bundle` dependency to the
+ * packed `@deepseek-ai/dsh` tarball so `selectDesktopPackageClosure` and the installAnchor both see it.
+ * Skips with a warning when the env var is unset (local / upstream builds). Throws when the env var is
+ * set but the file is missing — misconfiguration must fail the package step.
+ *
+ * @param packedDsh - `release:pack --family dsh` output directory.
+ * @param packedVendor - `release:pack --family vendor` output directory (also receives the XBuddy tgz).
+ */
+export function injectBkmsBundleIntoDesktopPack(packedDsh: string, packedVendor: string): void {
+  // bkms:
+  const xbuddyTgz = process.env.DSH_BKMS_XBUDDY_TGZ?.trim()
+  if (xbuddyTgz === undefined || xbuddyTgz === '') {
+    process.stderr.write('desktop package: bkms skipped (DSH_BKMS_XBUDDY_TGZ unset)\n')
+    return
+  }
+  if (!existsSync(xbuddyTgz)) {
+    throw new Error(`desktop package: bkms DSH_BKMS_XBUDDY_TGZ is set but file is missing: ${xbuddyTgz}`)
+  }
+
+  const xbuddy = packedManifest(xbuddyTgz)
+  if (xbuddy.name !== '@bkms/bundle') {
+    throw new Error(`desktop package: bkms expected @bkms/bundle, got ${String(xbuddy.name)}`)
+  }
+  if (typeof xbuddy.version !== 'string' || xbuddy.version === '') {
+    throw new Error('desktop package: bkms XBuddy tgz has no version')
+  }
+  const bundleVersion = xbuddy.version
+
+  const packedIndex = indexPackedTarballs([packedDsh, packedVendor])
+  const dshTarball = findPackedTarballByName(packedIndex, '@deepseek-ai/dsh')
+  const closureVersions = packedDshClosureVersions(packedIndex)
+
+  const peers = xbuddy.peerDependencies
+  if (peers !== null && typeof peers === 'object' && !Array.isArray(peers)) {
+    for (const [name, peerValue] of Object.entries(peers as Record<string, unknown>)) {
+      if (!name.startsWith('@deepseek-ai/')) continue
+      if (typeof peerValue !== 'string' || peerValue === '') {
+        throw new Error(`desktop package: bkms peerDependency ${name} must be a non-empty string`)
+      }
+      const actual = resolveBkmsPeerActualVersion(name, packedIndex, closureVersions)
+      if (!bkmsPeerAcceptsVersion(actual.version, peerValue)) {
+        throw new Error(
+          `desktop package: bkms peerDependency ${name} expected ${JSON.stringify(peerValue)}, `
+          + `actual ${JSON.stringify(actual.version)} (from ${actual.source})`,
+        )
+      }
+    }
+  }
+
+  rewritePackedPackageManifest(dshTarball, (manifest) => {
+    const dependencies = manifest.dependencies
+    const next = (dependencies !== null && typeof dependencies === 'object' && !Array.isArray(dependencies))
+      ? { ...dependencies as Record<string, string> }
+      : {}
+    next['@bkms/bundle'] = bundleVersion
+    manifest.dependencies = next
+  })
+
+  mkdirSync(packedVendor, { recursive: true })
+  const vendorDestination = join(packedVendor, basename(xbuddyTgz))
+  copyFileSync(xbuddyTgz, vendorDestination)
+  process.stdout.write(
+    `desktop package: bkms wired @bkms/bundle@${bundleVersion} into ${basename(dshTarball)}; copied ${basename(xbuddyTgz)} -> ${vendorDestination}\n`,
+  )
+}
+
 function runPnpm(
   args: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
@@ -486,6 +727,8 @@ export async function packageTarget(
     buildPaths.packedDsh,
   ], buildEnv, REPOSITORY_ROOT)
   await execute(['run', 'release:pack', '--family', 'vendor', '--out', buildPaths.packedVendor, ...packArguments], buildEnv, REPOSITORY_ROOT)
+  // bkms: 改 packed @deepseek-ai/dsh 的 dependencies，并拷 XBuddy tgz 进 packedVendor（不改仓库 lockfile）。
+  injectBkmsBundleIntoDesktopPack(buildPaths.packedDsh, buildPaths.packedVendor)
   rmSync(buildPaths.packedLandlock, { recursive: true, force: true })
   mkdirSync(buildPaths.packedLandlock, { recursive: true })
   await execute(['--dir', 'native/system', 'run', 'build:ts'], buildEnv, REPOSITORY_ROOT)

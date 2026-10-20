@@ -78,12 +78,14 @@ jobs:
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
       # —— bmks：在 frozen-lockfile 之外拉私有库现场 build+pack，不进 DSH 依赖图 ——
-      # 检出 bmks 默认分支最新代码（只读 Deploy Key）。
+      # 检出 bmks（只读 Deploy Key）。
+      # 临时：指向 fix/windows-spawn-pnpm，仅用于第 0 步验证 Windows spawn('pnpm') 修复；
+      # 对应 PR https://github.com/shaomai98/dsh-bkms/pull/1 合并后改回 main。
       - name: 检出 bmks
         uses: actions/checkout@v7.0.1
         with:
           repository: shaomai98/dsh-bkms
-          ref: main
+          ref: fix/windows-spawn-pnpm
           path: .ci/dsh-bkms
           ssh-key: ${{ secrets.BMKS_DEPLOY_KEY }}
           persist-credentials: false

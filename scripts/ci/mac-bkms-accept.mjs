@@ -55,16 +55,13 @@ mustExist(join(skillAssets, 'SKILL.md'))
 mustExist(join(skillAssets, 'scripts/validate_skill.mjs'))
 console.log('skill-creator assets OK under', skillAssets)
 
-section('1. codesign / Gatekeeper / stapler')
+section('1. codesign / Gatekeeper / stapler (raw outputs required)')
 const appPath = APP_ROOT
-run('codesign', ['--verify', '--deep', '--strict', '-v', appPath])
-run('spctl', ['-a', '-vv', '--type', 'exec', appPath], { allowFail: true })
+run('codesign', ['--verify', '--deep', '--strict', '-vv', appPath])
+run('spctl', ['-a', '-vv', '--type', 'exec', appPath])
 const dmg = process.env.DSH_ACCEPT_DMG
-if (dmg && existsSync(dmg)) {
-  run('xcrun', ['stapler', 'validate', dmg], { allowFail: true })
-} else {
-  console.log('skip stapler: DSH_ACCEPT_DMG not set')
-}
+if (!dmg || !existsSync(dmg)) throw new Error('DSH_ACCEPT_DMG required for stapler validate')
+run('xcrun', ['stapler', 'validate', dmg])
 
 section('2. provider: list/get skill-creator + Base directory')
 process.env.DSH_HOME = DSH_HOME
@@ -137,7 +134,16 @@ const helloScript = join(projectSkills, 'scripts/hello.mjs')
 writeFileSync(helloScript, `console.log('hello-from-skill-mjs')\n`)
 chmodSync(helloScript, 0o755)
 
-const nodeBin = process.env.DSH_ACCEPT_NODE || process.execPath
+// Must be the Desktop primary-runtime Node shipped in the .app (not runner system node).
+const nodeBin = process.env.DSH_ACCEPT_NODE
+if (!nodeBin || !existsSync(nodeBin)) {
+  throw new Error('DSH_ACCEPT_NODE must point at packaged primary-runtime node')
+}
+if (!nodeBin.includes('/runtime/primary-runtime/dependencies/node/bin/node')) {
+  throw new Error(`refusing non-packaged node: ${nodeBin}`)
+}
+console.log('using packaged node:', nodeBin)
+run(nodeBin, ['--version'])
 const hello = run(nodeBin, [helloScript])
 if (!hello.stdout.includes('hello-from-skill-mjs')) {
   throw new Error('hello.mjs did not print expected output')
@@ -147,6 +153,7 @@ const validator = join(matRoot, 'skill-creator/scripts/validate_skill.mjs')
 mustExist(validator)
 const validate = run(nodeBin, [validator, projectSkills])
 console.log('validate_skill.mjs status', validate.status)
+if (validate.status !== 0) throw new Error('validate_skill.mjs failed')
 
 // Discover via skill-filesystem if available in the installation.
 try {

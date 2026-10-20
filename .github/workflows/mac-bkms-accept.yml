@@ -26,7 +26,7 @@ jobs:
         with:
           persist-credentials: false
       - name: 下载签名 mac 产物
-        uses: actions/download-artifact@v7.0.1
+        uses: actions/download-artifact@v8.0.1
         with:
           run-id: ${{ env.SIGNED_RUN_ID }}
           name: macos-arm64-signed-${{ env.SIGNED_RUN_ID }}
@@ -51,19 +51,21 @@ jobs:
           codesign --verify --deep --strict -vv "$APP" 2>&1 | tee codesign-verify.txt
 
           echo '--- spctl -a -vv ---'
-          spctl -a -vv --type exec "$APP" 2>&1 | tee spctl.txt || true
+          spctl -a -vv --type exec "$APP" 2>&1 | tee spctl.txt
 
           echo '--- xcrun stapler validate DMG ---'
-          xcrun stapler validate "$DMG" 2>&1 | tee stapler.txt || true
+          xcrun stapler validate "$DMG" 2>&1 | tee stapler.txt
 
           echo '--- extract app.asar ---'
-          ASAR_JS=$(node -e "console.log(require.resolve('@electron/asar/bin/asar.js'))" 2>/dev/null || true)
-          if [[ -z "$ASAR_JS" ]]; then
-            npm pack @electron/asar@3.4.1 --pack-destination /tmp >/dev/null
-            mkdir -p /tmp/asar-pkg && tar -xzf /tmp/electron-asar-*.tgz -C /tmp/asar-pkg
-            ASAR_JS=/tmp/asar-pkg/package/bin/asar.js
-          fi
-          node "$ASAR_JS" extract "$APP/Contents/Resources/app.asar" asar-root
+          npm pack @electron/asar@3.4.1 --pack-destination /tmp >/dev/null
+          mkdir -p /tmp/asar-pkg && tar -xzf /tmp/electron-asar-*.tgz -C /tmp/asar-pkg
+          ASAR_JS=/tmp/asar-pkg/package/bin/asar.js
+          # 包内 primary-runtime Node（与 Desktop 自带 runtime 一致）；禁止用 runner 系统 node 跑脚本验收。
+          NODE_BIN="$APP/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
+          test -x "$NODE_BIN"
+          echo "PACKAGED_NODE=$NODE_BIN"
+          "$NODE_BIN" --version
+          "$NODE_BIN" "$ASAR_JS" extract "$APP/Contents/Resources/app.asar" asar-root
           python3 - <<'PY'
           import json
           p='asar-root/dsh/node_modules/@bkms/bundle/package.json'
@@ -78,18 +80,15 @@ jobs:
           export DSH_ACCEPT_APP_ROOT="$PWD/$APP"
           export DSH_ACCEPT_ASAR_ROOT="$PWD/asar-root"
           export DSH_ACCEPT_DMG="$PWD/$DMG"
-          export DSH_HOME="$RUNNER_TEMP/dsh-home-accept"
+          export DSH_ACCEPT_NODE="$NODE_BIN"
+          export DSH_HOME="$HOME/.dsh"
           export DSH_ACCEPT_WORK="$RUNNER_TEMP/bkms-accept-project"
           mkdir -p "$DSH_HOME" "$DSH_ACCEPT_WORK"
-          # Use app-bundled Node when present (arm64), else runner node.
-          NODE_BIN="$APP/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
-          if [[ -x "$NODE_BIN" ]]; then export DSH_ACCEPT_NODE="$NODE_BIN"; else export DSH_ACCEPT_NODE="$(command -v node)"; fi
-          echo "NODE=$DSH_ACCEPT_NODE"
-          "$DSH_ACCEPT_NODE" --version
-          "$DSH_ACCEPT_NODE" scripts/ci/mac-bkms-accept.mjs
+          # 整段验收脚本也用包内 Node 执行（含 validate_skill / 示例 .mjs）。
+          "$NODE_BIN" scripts/ci/mac-bkms-accept.mjs
       - name: 上传验收日志
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v8.0.1
         with:
           name: mac-bkms-accept-logs-${{ github.run_id }}
           path: |

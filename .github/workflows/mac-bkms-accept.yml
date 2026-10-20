@@ -1,0 +1,100 @@
+# 临时验收：签名 mac 包上核对 @bkms/bundle@0.1.3 / skill-creator。
+# 仅存在于 cursor/mac-signed-accept-e386；勿合入 PR #1；验完删分支。
+name: mac-bkms-accept
+on:
+  workflow_dispatch:
+  push:
+    branches: [cursor/mac-signed-accept-e386]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: mac-bkms-accept-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  accept:
+    name: macos-signed-accept
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      # 签名验收 run（build-desktop sign 路径产物）
+      SIGNED_RUN_ID: '39390545798'
+      DSH_TELEMETRY_DISABLED: '1'
+    steps:
+      - name: 检出临时验收分支
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: 下载签名 mac 产物
+        uses: actions/download-artifact@v7.0.1
+        with:
+          run-id: ${{ env.SIGNED_RUN_ID }}
+          name: macos-arm64-signed-${{ env.SIGNED_RUN_ID }}
+          path: artifacts
+          github-token: ${{ github.token }}
+      - name: 解包并验收
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la artifacts
+          DMG=$(echo artifacts/*.dmg)
+          ZIP=$(echo artifacts/*.zip)
+          echo "DMG=$DMG"
+          echo "ZIP=$ZIP"
+          mkdir -p app
+          unzip -q -o "$ZIP" -d app
+          APP="$(find app -name 'DeepSeek Harness.app' -type d | head -1)"
+          test -n "$APP"
+          echo "APP=$APP"
+
+          echo '--- codesign --verify --deep --strict ---'
+          codesign --verify --deep --strict -vv "$APP" 2>&1 | tee codesign-verify.txt
+
+          echo '--- spctl -a -vv ---'
+          spctl -a -vv --type exec "$APP" 2>&1 | tee spctl.txt || true
+
+          echo '--- xcrun stapler validate DMG ---'
+          xcrun stapler validate "$DMG" 2>&1 | tee stapler.txt || true
+
+          echo '--- extract app.asar ---'
+          ASAR_JS=$(node -e "console.log(require.resolve('@electron/asar/bin/asar.js'))" 2>/dev/null || true)
+          if [[ -z "$ASAR_JS" ]]; then
+            npm pack @electron/asar@3.4.1 --pack-destination /tmp >/dev/null
+            mkdir -p /tmp/asar-pkg && tar -xzf /tmp/electron-asar-*.tgz -C /tmp/asar-pkg
+            ASAR_JS=/tmp/asar-pkg/package/bin/asar.js
+          fi
+          node "$ASAR_JS" extract "$APP/Contents/Resources/app.asar" asar-root
+          python3 - <<'PY'
+          import json
+          p='asar-root/dsh/node_modules/@bkms/bundle/package.json'
+          m=json.load(open(p))
+          print(m['name'], m['version'])
+          assert m['name']=='@bkms/bundle' and m['version']=='0.1.3'
+          PY
+          test -f asar-root/dsh/node_modules/@bkms/bundle/assets/skills/skill-creator/SKILL.md
+          test -f asar-root/dsh/node_modules/@bkms/bundle/assets/skills/skill-creator/scripts/validate_skill.mjs
+          echo 'asar @bkms/bundle@0.1.3 + skill-creator assets OK'
+
+          export DSH_ACCEPT_APP_ROOT="$PWD/$APP"
+          export DSH_ACCEPT_ASAR_ROOT="$PWD/asar-root"
+          export DSH_ACCEPT_DMG="$PWD/$DMG"
+          export DSH_HOME="$RUNNER_TEMP/dsh-home-accept"
+          export DSH_ACCEPT_WORK="$RUNNER_TEMP/bkms-accept-project"
+          mkdir -p "$DSH_HOME" "$DSH_ACCEPT_WORK"
+          # Use app-bundled Node when present (arm64), else runner node.
+          NODE_BIN="$APP/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
+          if [[ -x "$NODE_BIN" ]]; then export DSH_ACCEPT_NODE="$NODE_BIN"; else export DSH_ACCEPT_NODE="$(command -v node)"; fi
+          echo "NODE=$DSH_ACCEPT_NODE"
+          "$DSH_ACCEPT_NODE" --version
+          "$DSH_ACCEPT_NODE" scripts/ci/mac-bkms-accept.mjs
+      - name: 上传验收日志
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: mac-bkms-accept-logs-${{ github.run_id }}
+          path: |
+            codesign-verify.txt
+            spctl.txt
+            stapler.txt
+          if-no-files-found: ignore
+          retention-days: 7
